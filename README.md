@@ -19,7 +19,7 @@ pip install j2toon
 or
 
 ```bash
-uv install j2toon
+  uv pip install j2toon
 ```
 
 ## Usage
@@ -33,9 +33,9 @@ from j2toon import json2toon, toon2json
 document = {
     "items": [
         {"sku": "A1", "qty": 2, "price": 9.99},
-        {"sku": "B2", "qty": 1, "price": 14.5},
+        {"sku": "B2", "qty": 1, "price": 14.5}
     ],
-    "tags": ["hardware", "beta"],
+    "tags": ["hardware", "beta"]
 }
 
 # Convert JSON to TOON format
