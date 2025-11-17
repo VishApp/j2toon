@@ -1,6 +1,6 @@
 [project]
 name = "j2toon"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python helpers to convert between JSON-compatible data and TOON."
 readme = "README.md"
 authors = [
