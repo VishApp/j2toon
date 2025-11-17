@@ -19,7 +19,7 @@ pip install j2toon
 or
 
 ```bash
-  uv pip install j2toon
+uv pip install j2toon
 ```
 
 ## Usage
