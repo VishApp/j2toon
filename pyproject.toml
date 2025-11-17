@@ -1,0 +1,34 @@
+[project]
+name = "j2toon"
+version = "0.1.0"
+description = "Python helpers to convert between JSON-compatible data and TOON."
+readme = "README.md"
+authors = [
+  { name = "Vishnu Prasad", email = "vishnuprasadapp@gmail.com" }
+]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+json2toon = "j2toon.cli:json2toon_cli"
+toon2json = "j2toon.cli:toon2json_cli"
+j2toon = "j2toon.cli:j2toon_cli"
+
+[project.urls]
+Homepage = "https://github.com/VishApp/j2toon"
+Repository = "https://github.com/VishApp/j2toon"
+Documentation = "https://github.com/VishApp/j2toon#readme"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+
