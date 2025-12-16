@@ -44,8 +44,7 @@ def _read_json(path: str | None) -> object:
 
 def _write_text(path: str | None, content: str) -> None:
     if path is None or path == "-":
-        sys.stdout.write(content)
-        sys.stdout.write("\n")
+        sys.stdout.write(content + "\n")
         return
     Path(path).write_text(content, encoding="utf-8")
 

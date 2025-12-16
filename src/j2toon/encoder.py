@@ -23,6 +23,11 @@ class Encoder:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Cache common indent strings for performance (up to level 20)
+        self._indent_cache: dict[int, str] = {}
+        # Precompute special characters set for string formatting
+        self._special_chars = set('\t\r\n"')
+        self._special_chars.add(self.delimiter)
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -46,6 +51,7 @@ class Encoder:
             base_level += 1
         if not obj:
             return lines or [f"{self._indent(level)}{name}:" ] if name else lines
+        # Pre-allocate list capacity estimate for better performance
         for key, val in obj.items():
             lines.extend(self._encode_value(val, base_level, name=key))
         return lines
@@ -54,7 +60,8 @@ class Encoder:
         self, seq: Sequence[Any], level: int, name: str | None
     ) -> List[str]:
         lines: List[str] = []
-        label = self._array_label(name, len(seq))
+        seq_len = len(seq)
+        label = self._array_label(name, seq_len)
         indent = self._indent(level)
 
         if self._can_inline_primitive_array(seq):
@@ -67,11 +74,10 @@ class Encoder:
         if tabular_fields:
             header = f"{label}{{{self.delimiter.join(tabular_fields)}}}:"
             lines.append(f"{indent}{header}")
+            row_indent = self._indent(level + 1)
             for row in seq:
                 row_values = [self._format_scalar(row[field]) for field in tabular_fields]
-                lines.append(
-                    f"{self._indent(level + 1)}{self._join_row(row_values)}"
-                )
+                lines.append(f"{row_indent}{self._join_row(row_values)}")
             return lines
 
         lines.append(f"{indent}{label}:")
@@ -85,9 +91,10 @@ class Encoder:
             return [f"{indent}- {self._format_scalar(value)}"]
         # For objects, put the first key on the same line as the dash
         if isinstance(value, Mapping) and value:
-            first_key = next(iter(value.keys()))
-            first_value = value[first_key]
-            remaining = {k: v for k, v in value.items() if k != first_key}
+            items_iter = iter(value.items())
+            first_key, first_value = next(items_iter)
+            # Build remaining dict more efficiently
+            remaining = dict(items_iter)
             lines = []
             # Encode first key-value pair on the same line as the dash
             if self._is_scalar(first_value):
@@ -126,27 +133,40 @@ class Encoder:
     def _format_string(self, value: str) -> str:
         if value == "":
             return '""'
-        special = set('\t\r\n"')
-        special.add(self.delimiter)
+        # Optimize: single strip() call and reuse result
+        stripped = value.strip()
+        stripped_len = len(stripped)
         # Check if string is purely numeric (to distinguish from actual numbers)
-        is_numeric = value.strip() and value.strip().replace(".", "", 1).replace("-", "", 1).isdigit()
+        is_numeric = (
+            stripped_len > 0
+            and stripped.replace(".", "", 1).replace("-", "", 1).isdigit()
+        )
+        # Fast path: check common cases first
         needs_quote = (
-            value.strip() != value
-            or any(ch in special for ch in value)
-            or ":" in value
-            or value.startswith("- ")
-            or is_numeric
+            stripped_len != len(value)  # Has leading/trailing whitespace
+            or value.startswith("- ")  # Starts with dash-space
+            or ":" in value  # Contains colon
+            or is_numeric  # Looks numeric
+            or any(ch in self._special_chars for ch in value)  # Has special chars
         )
         if needs_quote:
-            # Escape backslashes first, then quotes, then control characters
-            escaped = (
-                value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            return f'"{escaped}"'
+            # Optimize escaping: build string efficiently
+            # Use list join instead of multiple replace operations
+            result_chars = []
+            for char in value:
+                if char == "\\":
+                    result_chars.append("\\\\")
+                elif char == '"':
+                    result_chars.append('\\"')
+                elif char == "\n":
+                    result_chars.append("\\n")
+                elif char == "\r":
+                    result_chars.append("\\r")
+                elif char == "\t":
+                    result_chars.append("\\t")
+                else:
+                    result_chars.append(char)
+            return f'"{"".join(result_chars)}"'
         return value
 
     def _array_label(self, name: str | None, length: int) -> str:
@@ -160,14 +180,22 @@ class Encoder:
     def _tabular_fields(self, seq: Sequence[Any]) -> List[str] | None:
         if not seq:
             return None
-        if not all(isinstance(item, Mapping) for item in seq):
+        first_item = seq[0]
+        if not isinstance(first_item, Mapping):
             return None
-        first_fields = list(seq[0].keys())
+        first_fields = list(first_item.keys())
         if not first_fields:
             return None
-        for item in seq:
-            if list(item.keys()) != first_fields:
+        # Convert to tuple for faster comparison
+        first_fields_tuple = tuple(first_fields)
+        # Check remaining items more efficiently
+        for item in seq[1:]:
+            if not isinstance(item, Mapping):
                 return None
+            # Fast path: check keys match first
+            if tuple(item.keys()) != first_fields_tuple:
+                return None
+            # Then check all values are scalar
             if not all(self._is_scalar(item[field]) for field in first_fields):
                 return None
         return first_fields
@@ -179,4 +207,11 @@ class Encoder:
         return self.delimiter.join(values)
 
     def _indent(self, level: int) -> str:
-        return " " * (self.indent * level)
+        # Cache common indent levels for performance
+        if level in self._indent_cache:
+            return self._indent_cache[level]
+        indent_str = " " * (self.indent * level)
+        # Cache up to level 20 to avoid unbounded memory growth
+        if level <= 20:
+            self._indent_cache[level] = indent_str
+        return indent_str

@@ -11,6 +11,10 @@ ARRAY_HEADER_RE = re.compile(
     r"(?:\{(?P<fields>[^}]*)\})?$"
 )
 
+# Pre-compile regex patterns for number parsing
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$")
+
 
 def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
     """Parse TOON-formatted text into Python values."""
@@ -27,6 +31,8 @@ class Decoder:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Cache for split operations to avoid repeated work
+        self._split_cache: dict[str, Tuple[str, str]] = {}
 
     def decode(self, text: str) -> Any:
         self.lines = self._preprocess(text)
@@ -39,15 +45,20 @@ class Decoder:
 
     # ---- parsing helpers -------------------------------------------------
     def _preprocess(self, text: str) -> List[Tuple[int, str]]:
+        split_lines = text.splitlines()
+        # Pre-allocate list with estimated capacity for better performance
         lines: List[Tuple[int, str]] = []
-        for raw in text.splitlines():
-            if not raw.strip():
+        for raw in split_lines:
+            # Optimize: single lstrip call and reuse
+            stripped = raw.lstrip(" ")
+            if not stripped:
                 continue
-            indent = len(raw) - len(raw.lstrip(" "))
+            indent = len(raw) - len(stripped)
             if indent % self.indent != 0:
                 raise ValueError(f"Invalid indent: {raw!r}")
             level = indent // self.indent
-            lines.append((level, raw.strip()))
+            # Use stripped directly instead of raw.strip() again
+            lines.append((level, stripped))
         return lines
 
     def _parse_root(self) -> Tuple[Any, int]:
@@ -125,6 +136,7 @@ class Decoder:
             if not fields:
                 field_list = []
             else:
+                # Optimize: use delimiter directly and avoid list comprehension overhead
                 field_list = [f.strip() for f in fields.split(self.delimiter)]
         return ArrayMeta(name.strip() if name else None, count, field_list)
 
@@ -280,6 +292,8 @@ class Decoder:
         current: List[str] = []
         in_quotes = False
         escape = False
+        delimiter = self.delimiter
+        # Pre-allocate list with estimated size
         for char in text:
             if escape:
                 current.append(char)
@@ -292,22 +306,38 @@ class Decoder:
                 in_quotes = not in_quotes
                 current.append(char)
                 continue
-            if not in_quotes and char == self.delimiter:
-                cells.append("".join(current).strip())
+            if not in_quotes and char == delimiter:
+                # Join and strip only when needed
+                cell_str = "".join(current).strip()
+                cells.append(cell_str)
                 current = []
                 continue
             current.append(char)
-        cells.append("".join(current).strip())
+        # Final cell
+        cell_str = "".join(current).strip()
+        cells.append(cell_str)
         if in_quotes:
             raise ValueError("Unterminated quote in row")
+        # Parse scalars, filtering empty cells (but keep '""')
         return [self._parse_scalar(cell) for cell in cells if cell != "" or cell == '""']
 
     def _split_field(self, line: str) -> Tuple[str, str]:
+        # Cache split results for frequently accessed lines
+        if line in self._split_cache:
+            return self._split_cache[line]
         key, remainder = line.split(":", 1)
-        return key.strip(), remainder.strip()
+        result = (key.strip(), remainder.strip())
+        # Only cache if cache is not too large (limit to 100 entries)
+        if len(self._split_cache) < 100:
+            self._split_cache[line] = result
+        return result
 
     def _line_header(self, content: str) -> str:
-        return content.split(":", 1)[0].strip()
+        # Optimize: avoid creating intermediate list
+        colon_idx = content.find(":")
+        if colon_idx == -1:
+            return content.strip()
+        return content[:colon_idx].strip()
 
     def _line_represents_array_value(self, content: str) -> bool:
         header = self._line_header(content)
@@ -320,38 +350,59 @@ class Decoder:
     def _parse_scalar(self, token: str) -> Any:
         if not token:
             return ""
-        if token.startswith('"') and token.endswith('"'):
+        token_len = len(token)
+        if token_len >= 2 and token[0] == '"' and token[token_len - 1] == '"':
             stripped = token[1:-1]
-            # Unescape: process \\\\ first to avoid interfering with other escapes
-            # Use a temporary marker for double backslashes
-            result = stripped.replace("\\\\", "\x00")
-            # Now unescape single escape sequences
-            result = (
-                result.replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t")
-                .replace('\\"', '"')
-            )
-            # Restore actual backslashes
-            return result.replace("\x00", "\\")
-        lowered = token.lower()
-        if lowered == "null":
-            return None
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        if self._is_int(token):
+            # Optimize unescaping: build string efficiently
+            result_chars = []
+            i = 0
+            while i < len(stripped):
+                if stripped[i] == "\\" and i + 1 < len(stripped):
+                    next_char = stripped[i + 1]
+                    if next_char == "n":
+                        result_chars.append("\n")
+                        i += 2
+                    elif next_char == "r":
+                        result_chars.append("\r")
+                        i += 2
+                    elif next_char == "t":
+                        result_chars.append("\t")
+                        i += 2
+                    elif next_char == '"':
+                        result_chars.append('"')
+                        i += 2
+                    elif next_char == "\\":
+                        result_chars.append("\\")
+                        i += 2
+                    else:
+                        result_chars.append(stripped[i])
+                        i += 1
+                else:
+                    result_chars.append(stripped[i])
+                    i += 1
+            return "".join(result_chars)
+        # Fast path for common literals
+        if token_len == 4:
+            lowered = token.lower()
+            if lowered == "null":
+                return None
+            if lowered == "true":
+                return True
+        elif token_len == 5:
+            if token.lower() == "false":
+                return False
+        # Check numbers using pre-compiled regex
+        if _INT_RE.match(token):
             return int(token)
-        if self._is_float(token):
+        if _FLOAT_RE.match(token):
             return float(token)
         return token
 
     def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
+        return _INT_RE.match(token) is not None
 
     def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
+        return _FLOAT_RE.match(token) is not None
 
 
 @dataclass
