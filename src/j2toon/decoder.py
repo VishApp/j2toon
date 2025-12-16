@@ -6,10 +6,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Sequence, Tuple
 
+# Precompile regexes used in tight loops for better performance
 ARRAY_HEADER_RE = re.compile(
     r"^(?:(?P<name>[^[]+))?\[(?P<count>\d+)(?P<delimiter_hint>.)?\]"
     r"(?:\{(?P<fields>[^}]*)\})?$"
 )
+INT_RE = re.compile(r"[+-]?\d+")
+FLOAT_RE = re.compile(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?")
 
 
 def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
@@ -17,10 +20,11 @@ def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
     return Decoder(indent=indent, delimiter=delimiter).decode(text)
 
 
-@dataclass
+@dataclass(slots=True)
 class Decoder:
     indent: int = 2
     delimiter: str = ","
+    lines: List[Tuple[int, str]] = None  # type: ignore
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
@@ -276,30 +280,56 @@ class Decoder:
             return self._parse_scalar(remainder), idx + 1
 
     def _parse_row(self, text: str) -> List[Any]:
+        # Optimized row parsing with fewer allocations
         cells: List[str] = []
-        current: List[str] = []
+        current_parts: List[str] = []
         in_quotes = False
-        escape = False
-        for char in text:
-            if escape:
-                current.append(char)
-                escape = False
-                continue
-            if char == "\\" and in_quotes:
-                escape = True
-                continue
+        i = 0
+        start = 0
+        
+        while i < len(text):
+            char = text[i]
+            
             if char == '"':
                 in_quotes = not in_quotes
-                current.append(char)
+                i += 1
                 continue
+            
+            if char == "\\" and in_quotes and i + 1 < len(text):
+                # Handle escape sequence - accumulate current segment
+                if i > start:
+                    current_parts.append(text[start:i])
+                current_parts.append(text[i + 1])  # Add escaped character
+                i += 2
+                start = i
+                continue
+            
             if not in_quotes and char == self.delimiter:
-                cells.append("".join(current).strip())
-                current = []
+                # Found delimiter - save current cell
+                if i > start or current_parts:
+                    if i > start:
+                        current_parts.append(text[start:i])
+                    cells.append("".join(current_parts).strip())
+                    current_parts = []
+                else:
+                    cells.append("")
+                i += 1
+                start = i
                 continue
-            current.append(char)
-        cells.append("".join(current).strip())
+            
+            i += 1
+        
+        # Add final cell
+        if start < len(text) or current_parts:
+            if start < len(text):
+                current_parts.append(text[start:])
+            cells.append("".join(current_parts).strip())
+        elif not cells:
+            cells.append("")
+        
         if in_quotes:
             raise ValueError("Unterminated quote in row")
+        
         return [self._parse_scalar(cell) for cell in cells if cell != "" or cell == '""']
 
     def _split_field(self, line: str) -> Tuple[str, str]:
@@ -348,13 +378,13 @@ class Decoder:
         return token
 
     def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
+        return INT_RE.fullmatch(token) is not None
 
     def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
+        return FLOAT_RE.fullmatch(token) is not None
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class ArrayMeta:
     name: str | None
     count: int

@@ -11,18 +11,21 @@ def encode(value: Any, *, indent: int = 2, delimiter: str = ",") -> str:
     return Encoder(indent=indent, delimiter=delimiter).encode(value)
 
 
-@dataclass
+@dataclass(slots=True)
 class Encoder:
     """Stateful encoder that emits TOON text."""
 
     indent: int = 2
     delimiter: str = ","
+    _indent_cache: dict[int, str] = None  # type: ignore
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Cache indent strings for better performance
+        object.__setattr__(self, '_indent_cache', {})
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -58,7 +61,7 @@ class Encoder:
         indent = self._indent(level)
 
         if self._can_inline_primitive_array(seq):
-            body = self._join_row(self._format_scalar(v) for v in seq)
+            body = self.delimiter.join(self._format_scalar(v) for v in seq)
             suffix = f" {body}" if body else ""
             lines.append(f"{indent}{label}:{suffix}")
             return lines
@@ -70,7 +73,7 @@ class Encoder:
             for row in seq:
                 row_values = [self._format_scalar(row[field]) for field in tabular_fields]
                 lines.append(
-                    f"{self._indent(level + 1)}{self._join_row(row_values)}"
+                    f"{self._indent(level + 1)}{self.delimiter.join(row_values)}"
                 )
             return lines
 
@@ -175,8 +178,7 @@ class Encoder:
     def _is_scalar(self, value: Any) -> bool:
         return isinstance(value, (str, int, float, bool)) or value is None
 
-    def _join_row(self, values: Iterable[str]) -> str:
-        return self.delimiter.join(values)
-
     def _indent(self, level: int) -> str:
-        return " " * (self.indent * level)
+        if level not in self._indent_cache:
+            self._indent_cache[level] = " " * (self.indent * level)
+        return self._indent_cache[level]
