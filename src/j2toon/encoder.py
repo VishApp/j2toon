@@ -4,6 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Mapping, Sequence
+import re
+
+_IS_INT = re.compile(r"^[+-]?\d+$")
+_IS_FLOAT = re.compile(r"^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$")
+_ESCAPE_TABLE = str.maketrans({
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t"
+})
+_SPECIAL_CHARS = frozenset('\t\r\n"')
+_KEYWORDS = {"true", "false", "null"}
 
 
 def encode(value: Any, *, indent: int = 2, delimiter: str = ",") -> str:
@@ -23,6 +36,10 @@ class Encoder:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Compile regex for special characters
+        # Escape delimiter if it's a special regex char
+        delim = re.escape(self.delimiter)
+        self._special_regex = re.compile(f'[\\t\\r\\n"{delim}]')
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -124,29 +141,32 @@ class Encoder:
         raise TypeError(f"Unsupported value type: {type(value)!r}")
 
     def _format_string(self, value: str) -> str:
-        if value == "":
+        if not value:
             return '""'
-        special = set('\t\r\n"')
-        special.add(self.delimiter)
-        # Check if string is purely numeric (to distinguish from actual numbers)
-        is_numeric = value.strip() and value.strip().replace(".", "", 1).replace("-", "", 1).isdigit()
-        needs_quote = (
-            value.strip() != value
-            or any(ch in special for ch in value)
-            or ":" in value
-            or value.startswith("- ")
-            or is_numeric
-        )
-        if needs_quote:
-            # Escape backslashes first, then quotes, then control characters
-            escaped = (
-                value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            return f'"{escaped}"'
+
+        # Check for control chars, quote early using regex (fast)
+        if self._special_regex.search(value):
+             return f'"{value.translate(_ESCAPE_TABLE)}"'
+
+        # Whitespace padding
+        stripped = value.strip()
+        if value != stripped:
+             return f'"{value.translate(_ESCAPE_TABLE)}"'
+        
+        # Syntax ambiguity
+        if ":" in value or value.startswith("- "):
+             return f'"{value}"' # No special chars, so no translate needed
+
+        # Scalar ambiguity (numeric or keywords)
+        c = value[0]
+        if (c >= '0' and c <= '9') or c == '-' or c == '+':
+            if _IS_INT.match(value) or _IS_FLOAT.match(value):
+                return f'"{value}"'
+        
+        if value.lower() in _KEYWORDS:
+             return f'"{value}"'
+             
+        # Safe
         return value
 
     def _array_label(self, name: str | None, length: int) -> str:

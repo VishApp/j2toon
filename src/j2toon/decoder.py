@@ -6,6 +6,18 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Sequence, Tuple
 
+_UNESCAPE_REGEX = re.compile(r'\\(["\\nrt])')
+_UNESCAPE_MAP = {
+    'n': '\n',
+    'r': '\r',
+    't': '\t',
+    '"': '"',
+    '\\': '\\'
+}
+
+def _unescape_match(m: re.Match) -> str:
+    return _UNESCAPE_MAP.get(m.group(1), m.group(0))
+
 ARRAY_HEADER_RE = re.compile(
     r"^(?:(?P<name>[^[]+))?\[(?P<count>\d+)(?P<delimiter_hint>.)?\]"
     r"(?:\{(?P<fields>[^}]*)\})?$"
@@ -321,37 +333,35 @@ class Decoder:
         if not token:
             return ""
         if token.startswith('"') and token.endswith('"'):
-            stripped = token[1:-1]
-            # Unescape: process \\\\ first to avoid interfering with other escapes
-            # Use a temporary marker for double backslashes
-            result = stripped.replace("\\\\", "\x00")
-            # Now unescape single escape sequences
-            result = (
-                result.replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t")
-                .replace('\\"', '"')
-            )
-            # Restore actual backslashes
-            return result.replace("\x00", "\\")
-        lowered = token.lower()
-        if lowered == "null":
-            return None
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        if self._is_int(token):
-            return int(token)
-        if self._is_float(token):
-            return float(token)
+            return _UNESCAPE_REGEX.sub(_unescape_match, token[1:-1])
+
+        if len(token) <= 5:
+            lowered = token.lower()
+            if lowered == "null":
+                return None
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+
+        # Parse numbers
+        # Heuristic: only try to parse as number if it looks like one
+        c = token[0]
+        if (c >= '0' and c <= '9') or c == '-' or c == '+':
+            try:
+                return int(token)
+            except ValueError:
+                pass
+
+            try:
+                val = float(token)
+                if val != val or val == float('inf') or val == float('-inf'):
+                    return token
+                return val
+            except ValueError:
+                pass
+            
         return token
-
-    def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
-
-    def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
 
 
 @dataclass
