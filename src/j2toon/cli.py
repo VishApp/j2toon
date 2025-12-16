@@ -7,9 +7,6 @@ import json
 import sys
 from pathlib import Path
 
-from .encoder import encode as json2toon
-from .decoder import decode as toon2json
-
 _DELIMITER_ALIASES = {
     "comma": ",",
     ",": ",",
@@ -60,6 +57,9 @@ def _write_json(path: str | None, payload: object) -> None:
 
 
 def json2toon_cli() -> None:
+    # Lazy import to minimize CLI startup cost for --help and parsing.
+    from .encoder import encode as json2toon
+
     parser = argparse.ArgumentParser(description="Convert JSON to TOON")
     parser.add_argument("input", nargs="?", default="-", help="JSON file (default: stdin)")
     parser.add_argument(
@@ -83,6 +83,9 @@ def json2toon_cli() -> None:
 
 
 def toon2json_cli() -> None:
+    # Lazy import to minimize CLI startup cost for --help and parsing.
+    from .decoder import decode as toon2json
+
     parser = argparse.ArgumentParser(description="Convert TOON to JSON")
     parser.add_argument("input", nargs="?", default="-", help="TOON file (default: stdin)")
     parser.add_argument(
@@ -107,6 +110,10 @@ def toon2json_cli() -> None:
 
 def j2toon_cli() -> None:
     """Unified CLI that auto-detects conversion direction."""
+    # Lazy imports to minimize CLI startup cost for --help and parsing.
+    from .decoder import decode as toon2json
+    from .encoder import encode as json2toon
+
     parser = argparse.ArgumentParser(
         description="Convert between JSON and TOON formats (auto-detects direction)",
         formatter_class=argparse.RawDescriptionHelpFormatter,

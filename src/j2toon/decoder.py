@@ -10,6 +10,8 @@ ARRAY_HEADER_RE = re.compile(
     r"^(?:(?P<name>[^[]+))?\[(?P<count>\d+)(?P<delimiter_hint>.)?\]"
     r"(?:\{(?P<fields>[^}]*)\})?$"
 )
+INT_RE = re.compile(r"[+-]?\d+$")
+FLOAT_RE = re.compile(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$")
 
 
 def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
@@ -41,13 +43,15 @@ class Decoder:
     def _preprocess(self, text: str) -> List[Tuple[int, str]]:
         lines: List[Tuple[int, str]] = []
         for raw in text.splitlines():
-            if not raw.strip():
+            stripped = raw.strip()
+            if not stripped:
                 continue
-            indent = len(raw) - len(raw.lstrip(" "))
+            lstripped = raw.lstrip(" ")
+            indent = len(raw) - len(lstripped)
             if indent % self.indent != 0:
                 raise ValueError(f"Invalid indent: {raw!r}")
             level = indent // self.indent
-            lines.append((level, raw.strip()))
+            lines.append((level, stripped))
         return lines
 
     def _parse_root(self) -> Tuple[Any, int]:
@@ -276,6 +280,14 @@ class Decoder:
             return self._parse_scalar(remainder), idx + 1
 
     def _parse_row(self, text: str) -> List[Any]:
+        # Fast path: most rows are simple delimited cells without quotes/escapes.
+        if '"' not in text and "\\" not in text:
+            parts = [part.strip() for part in text.split(self.delimiter)]
+            return [
+                self._parse_scalar(cell)
+                for cell in parts
+                if cell != "" or cell == '""'
+            ]
         cells: List[str] = []
         current: List[str] = []
         in_quotes = False
@@ -348,10 +360,10 @@ class Decoder:
         return token
 
     def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
+        return INT_RE.fullmatch(token) is not None
 
     def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
+        return FLOAT_RE.fullmatch(token) is not None
 
 
 @dataclass

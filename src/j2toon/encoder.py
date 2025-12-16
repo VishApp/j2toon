@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Mapping, Sequence
 
 
@@ -17,12 +17,17 @@ class Encoder:
 
     indent: int = 2
     delimiter: str = ","
+    _indent_cache: List[str] = field(init=False, repr=False)
+    _special_chars: frozenset[str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Small caches to avoid repeated allocations in hot paths.
+        self._indent_cache = [""]
+        self._special_chars = frozenset({"\t", "\r", "\n", '"', self.delimiter})
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -32,7 +37,9 @@ class Encoder:
     def _encode_value(self, value: Any, level: int, name: str | None) -> List[str]:
         if isinstance(value, Mapping):
             return self._encode_object(value, level, name)
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list):
+            return self._encode_array(value, level, name)
+        if isinstance(value, tuple):
             return self._encode_array(list(value), level, name)
         return self._encode_scalar(value, level, name)
 
@@ -85,9 +92,8 @@ class Encoder:
             return [f"{indent}- {self._format_scalar(value)}"]
         # For objects, put the first key on the same line as the dash
         if isinstance(value, Mapping) and value:
-            first_key = next(iter(value.keys()))
-            first_value = value[first_key]
-            remaining = {k: v for k, v in value.items() if k != first_key}
+            items_iter = iter(value.items())
+            first_key, first_value = next(items_iter)
             lines = []
             # Encode first key-value pair on the same line as the dash
             if self._is_scalar(first_value):
@@ -97,7 +103,7 @@ class Encoder:
                 lines.extend(self._encode_value(first_value, level + 1, name=None))
             # Encode remaining key-value pairs - they should be indented to align
             # with the value part of the first key (level + 1)
-            for key, val in remaining.items():
+            for key, val in items_iter:
                 lines.extend(self._encode_value(val, level + 1, name=key))
             return lines
         # For non-object, non-scalar values (like arrays), use the old format
@@ -126,13 +132,21 @@ class Encoder:
     def _format_string(self, value: str) -> str:
         if value == "":
             return '""'
-        special = set('\t\r\n"')
-        special.add(self.delimiter)
         # Check if string is purely numeric (to distinguish from actual numbers)
-        is_numeric = value.strip() and value.strip().replace(".", "", 1).replace("-", "", 1).isdigit()
+        stripped = value.strip()
+        if stripped:
+            numeric_candidate = stripped
+            if numeric_candidate[0] in "+-":
+                numeric_candidate = numeric_candidate[1:]
+            is_numeric = (
+                bool(numeric_candidate)
+                and numeric_candidate.replace(".", "", 1).isdigit()
+            )
+        else:
+            is_numeric = False
         needs_quote = (
-            value.strip() != value
-            or any(ch in special for ch in value)
+            stripped != value
+            or any(ch in self._special_chars for ch in value)
             or ":" in value
             or value.startswith("- ")
             or is_numeric
@@ -179,4 +193,10 @@ class Encoder:
         return self.delimiter.join(values)
 
     def _indent(self, level: int) -> str:
-        return " " * (self.indent * level)
+        # Cache indentation strings by level (hot path).
+        cache = self._indent_cache
+        if level < len(cache):
+            return cache[level]
+        while len(cache) <= level:
+            cache.append(" " * (self.indent * len(cache)))
+        return cache[level]
