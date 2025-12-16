@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Any, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Sequence, Tuple
 
+# Pre-compiled regex patterns for performance
 ARRAY_HEADER_RE = re.compile(
     r"^(?:(?P<name>[^[]+))?\[(?P<count>\d+)(?P<delimiter_hint>.)?\]"
     r"(?:\{(?P<fields>[^}]*)\})?$"
 )
+
+# Pre-compiled patterns for number detection (avoid recompilation per call)
+_INT_RE = re.compile(r"[+-]?\d+$")
+_FLOAT_RE = re.compile(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$")
+
+# Pre-computed scalar keyword lookups
+_SCALAR_KEYWORDS: Dict[str, Any] = {
+    "null": None,
+    "true": True,
+    "false": False,
+}
+
+# Escape sequence mappings for string unescaping
+_UNESCAPE_MAP: Dict[str, str] = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    '"': '"',
+    "\\": "\\",
+}
 
 
 def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
@@ -17,10 +38,11 @@ def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
     return Decoder(indent=indent, delimiter=delimiter).decode(text)
 
 
-@dataclass
+@dataclass(slots=True)
 class Decoder:
     indent: int = 2
     delimiter: str = ","
+    lines: List[Tuple[int, str]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
@@ -320,41 +342,55 @@ class Decoder:
     def _parse_scalar(self, token: str) -> Any:
         if not token:
             return ""
+        
+        # Fast path for quoted strings
         if token.startswith('"') and token.endswith('"'):
-            stripped = token[1:-1]
-            # Unescape: process \\\\ first to avoid interfering with other escapes
-            # Use a temporary marker for double backslashes
-            result = stripped.replace("\\\\", "\x00")
-            # Now unescape single escape sequences
-            result = (
-                result.replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t")
-                .replace('\\"', '"')
-            )
-            # Restore actual backslashes
-            return result.replace("\x00", "\\")
-        lowered = token.lower()
-        if lowered == "null":
-            return None
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        if self._is_int(token):
+            return self._unescape_string(token[1:-1])
+        
+        # Check for keyword values using pre-computed lookup
+        keyword_value = _SCALAR_KEYWORDS.get(token.lower())
+        if keyword_value is not None or token.lower() in _SCALAR_KEYWORDS:
+            return keyword_value
+        
+        # Try to parse as number (use pre-compiled patterns)
+        if _INT_RE.match(token):
             return int(token)
-        if self._is_float(token):
+        if _FLOAT_RE.match(token):
             return float(token)
+        
         return token
 
+    def _unescape_string(self, s: str) -> str:
+        """Unescape a quoted string value efficiently."""
+        # Fast path: no escape sequences
+        if "\\" not in s:
+            return s
+        
+        # Single-pass unescaping
+        result = []
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "\\" and i + 1 < n:
+                next_ch = s[i + 1]
+                unescaped = _UNESCAPE_MAP.get(next_ch)
+                if unescaped is not None:
+                    result.append(unescaped)
+                    i += 2
+                    continue
+            result.append(ch)
+            i += 1
+        return "".join(result)
+
     def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
+        return _INT_RE.match(token) is not None
 
     def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
+        return _FLOAT_RE.match(token) is not None
 
 
-@dataclass
+@dataclass(slots=True)
 class ArrayMeta:
     name: str | None
     count: int

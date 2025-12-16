@@ -2,8 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Sequence
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
+
+# Pre-compiled escape sequences for string formatting (single pass optimization)
+_ESCAPE_MAP: Dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+# Characters that always require quoting (delimiter added dynamically)
+_BASE_SPECIAL_CHARS = frozenset('\t\r\n"')
+
+# Optimized empty string join (avoid method lookup overhead)
+_join_empty = "".join
 
 
 def encode(value: Any, *, indent: int = 2, delimiter: str = ",") -> str:
@@ -11,18 +27,24 @@ def encode(value: Any, *, indent: int = 2, delimiter: str = ",") -> str:
     return Encoder(indent=indent, delimiter=delimiter).encode(value)
 
 
-@dataclass
+@dataclass(slots=True)
 class Encoder:
     """Stateful encoder that emits TOON text."""
 
     indent: int = 2
     delimiter: str = ","
+    # Cache for indentation strings (avoids repeated string multiplication)
+    _indent_cache: Dict[int, str] = field(default_factory=dict, repr=False)
+    # Pre-computed special chars set including delimiter (set in __post_init__)
+    _special_chars: frozenset = field(default=_BASE_SPECIAL_CHARS, repr=False)
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        # Pre-compute special chars set including delimiter
+        object.__setattr__(self, "_special_chars", _BASE_SPECIAL_CHARS | {self.delimiter})
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -124,29 +146,37 @@ class Encoder:
         raise TypeError(f"Unsupported value type: {type(value)!r}")
 
     def _format_string(self, value: str) -> str:
-        if value == "":
+        if not value:
             return '""'
-        special = set('\t\r\n"')
-        special.add(self.delimiter)
-        # Check if string is purely numeric (to distinguish from actual numbers)
-        is_numeric = value.strip() and value.strip().replace(".", "", 1).replace("-", "", 1).isdigit()
+        
+        # Fast path: check if quoting is needed
+        stripped = value.strip()
         needs_quote = (
-            value.strip() != value
-            or any(ch in special for ch in value)
+            stripped != value
             or ":" in value
             or value.startswith("- ")
-            or is_numeric
         )
+        
+        # Only check special chars if not already needing quote
+        if not needs_quote:
+            special_chars = self._special_chars
+            for ch in value:
+                if ch in special_chars:
+                    needs_quote = True
+                    break
+        
+        # Check if string looks numeric (to distinguish from actual numbers)
+        if not needs_quote and stripped:
+            temp = stripped.replace(".", "", 1).replace("-", "", 1)
+            if temp.isdigit():
+                needs_quote = True
+        
         if needs_quote:
-            # Escape backslashes first, then quotes, then control characters
-            escaped = (
-                value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            return f'"{escaped}"'
+            # Single-pass escape using list comprehension (faster than chained replace)
+            escaped_chars = []
+            for ch in value:
+                escaped_chars.append(_ESCAPE_MAP.get(ch, ch))
+            return f'"{_join_empty(escaped_chars)}"'
         return value
 
     def _array_label(self, name: str | None, length: int) -> str:
@@ -179,4 +209,8 @@ class Encoder:
         return self.delimiter.join(values)
 
     def _indent(self, level: int) -> str:
-        return " " * (self.indent * level)
+        # Use cached indentation strings to avoid repeated string multiplication
+        cache = self._indent_cache
+        if level not in cache:
+            cache[level] = " " * (self.indent * level)
+        return cache[level]
