@@ -114,6 +114,39 @@ share the same scalar fields, a `ValueError` is raised so you can fix the input
 instead of silently getting a different layout. Primitive arrays and mixed
 arrays are unaffected and keep their normal representation.
 
+Tables use the field order of the **first row** for the header. Later rows may
+list the same fields in any order; they are mapped back onto the first row's
+order when decoded.
+
+`mode` is an encoding-only option. It is accepted by `json2toon` (and the
+`json2toon` / `j2toon convert` commands) but not by `toon2json`, whose only
+decode-time options are `indent` and `delimiter`.
+
+### Reserved strings, exponents, and special keys
+
+Values that merely look like other types stay strings: `"true"`, `"null"`,
+`"123"`, `"1e5"`, and other numeric-looking tokens are quoted on the way out so
+they decode back to strings. Exponents such as `2e-05` and `1e16` are written
+bare and decode to floats. Keys containing delimiters or structural characters
+(`a,b`, `a:b`, `a[0]`, empty strings, leading dashes) are quoted too:
+
+```python
+from j2toon import json2toon, toon2json
+
+document = {
+    "true": "false",        # reserved word as a key
+    "ratio": 2e-05,         # exponent number
+    "a,b": "x:y",           # delimiter/structural chars in key and value
+}
+
+text = json2toon(document)
+# true: "false"
+# ratio: 2e-05
+# "a,b": "x:y"
+
+assert toon2json(text) == document
+```
+
 ```bash
 json2toon data.json --mode nested        # Force nested list entries
 json2toon data.json --mode table         # Force tables, error if impossible

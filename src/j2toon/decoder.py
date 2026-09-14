@@ -6,10 +6,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Sequence, Tuple
 
-ARRAY_HEADER_RE = re.compile(
-    r"^(?:(?P<name>[^[]+))?\[(?P<count>\d+)(?P<delimiter_hint>.)?\]"
-    r"(?:\{(?P<fields>[^}]*)\})?$"
+from ._syntax import (
+    NUMBER_RE,
+    find_unquoted,
+    is_quoted,
+    split_unquoted,
+    unquote,
 )
+
+_ARRAY_BRACKET_RE = re.compile(r"\[(\d+)(.)?\]")
+_INT_RE = re.compile(r"[+-]?\d+")
 
 
 def decode(text: str, *, indent: int = 2, delimiter: str = ",") -> Any:
@@ -40,27 +46,38 @@ class Decoder:
     # ---- parsing helpers -------------------------------------------------
     def _preprocess(self, text: str) -> List[Tuple[int, str]]:
         lines: List[Tuple[int, str]] = []
-        for raw in text.splitlines():
-            if not raw.strip():
+        # Split only on "\n" so that quoted control characters (which
+        # str.splitlines would otherwise treat as line boundaries) survive.
+        for raw in text.split("\n"):
+            line = raw.rstrip("\r")
+            if not line.strip(" "):
                 continue
-            indent = len(raw) - len(raw.lstrip(" "))
+            indent = len(line) - len(line.lstrip(" "))
             if indent % self.indent != 0:
                 raise ValueError(f"Invalid indent: {raw!r}")
             level = indent // self.indent
-            lines.append((level, raw.strip()))
+            lines.append((level, line.strip(" ")))
         return lines
 
     def _parse_root(self) -> Tuple[Any, int]:
-        # Root can be a single array or an object with multiple keys
-        # If first line is an array, check if there are more root-level items
+        # Root can be a bare scalar, a single array, or an object.
         level, content = self.lines[0]
         if self._line_starts_with_array(content):
-            name, value, idx = self._parse_array_from_line(0)
-            # If there are more root-level items, parse as object instead
-            if idx < len(self.lines) and self.lines[idx][0] == 0:
-                # Multiple root items - parse as object
-                return self._parse_object(0, level=0)
-            return value if name is None else {name: value}, idx
+            if self._has_colon(content):
+                name, value, idx = self._parse_array_from_line(0)
+                # If there are more root-level items, parse as object instead.
+                if idx < len(self.lines) and self.lines[idx][0] == 0:
+                    return self._parse_object(0, level=0)
+                return value if name is None else {name: value}, idx
+            if self._looks_like_array_header(content):
+                raise ValueError(f"Array header missing ':' - {content!r}")
+            return self._parse_scalar(content), 1
+        if len(self.lines) == 1 and not self._has_colon(content):
+            # A single unquoted token is a bare root scalar (e.g. ``42``,
+            # ``true``, ``hello``, ``[a]``).  Multi-token lines without a
+            # colon keep raising so malformed objects stay detectable.
+            if is_quoted(content) or " " not in content:
+                return self._parse_scalar(content), 1
         value, idx = self._parse_object(0, level=0)
         return value, idx
 
@@ -79,7 +96,7 @@ class Decoder:
                     raise ValueError("Unnamed array encountered inside object")
                 result[name] = value
                 continue
-            if ":" not in content:
+            if not self._has_colon(content):
                 raise ValueError(f"Missing ':' in object entry: {content!r}")
             key, remainder = self._split_field(content)
             if remainder:
@@ -90,7 +107,6 @@ class Decoder:
                 result[key] = {}
                 idx += 1
                 continue
-            # Parse nested object directly (not using _parse_block which only handles single values)
             value, idx = self._parse_object(idx + 1, level + 1)
             result[key] = value
         return result, idx
@@ -98,15 +114,22 @@ class Decoder:
     def _parse_block(self, start: int, level: int) -> Tuple[Any, int]:
         _, content = self.lines[start]
         if self._line_starts_with_array(content):
-            name, value, idx = self._parse_array_from_line(start)
-            return value if name is None else {name: value}, idx
+            # A bare (unnamed) array header is a standalone array value; a
+            # named header is the first field of an object, so parse the whole
+            # object to keep its sibling keys.
+            header = self._header_part(content).strip()
+            if header.startswith("["):
+                _, value, idx = self._parse_array_from_line(start)
+                return value, idx
         return self._parse_object(start, level)
 
     def _parse_array_from_line(self, idx: int) -> Tuple[str | None, Any, int]:
         level, content = self.lines[idx]
-        if ":" not in content:
+        colon = find_unquoted(content, ":")
+        if colon < 0:
             raise ValueError(f"Array header missing ':' - {content!r}")
-        header, remainder = self._split_field(content)
+        header = content[:colon].strip()
+        remainder = content[colon + 1 :].strip()
         metadata = self._parse_array_header(header)
         value, next_idx = self._parse_array_body(
             metadata, remainder, idx + 1, level + 1
@@ -114,19 +137,38 @@ class Decoder:
         return metadata.name, value, next_idx
 
     def _parse_array_header(self, header: str):
-        match = ARRAY_HEADER_RE.match(header)
+        header = header.strip()
+        open_idx = find_unquoted(header, "[")
+        if open_idx < 0:
+            raise ValueError(f"Invalid array header: {header!r}")
+        name_part = header[:open_idx].strip()
+        rest = header[open_idx:]
+        match = _ARRAY_BRACKET_RE.match(rest)
         if not match:
             raise ValueError(f"Invalid array header: {header!r}")
-        name = match.group("name")
-        count = int(match.group("count"))
-        fields = match.group("fields")
+        count = int(match.group(1))
+        tail = rest[match.end() :].strip()
         field_list = None
-        if fields is not None:
-            if not fields:
+        if tail.startswith("{"):
+            end = find_unquoted(tail, "}")
+            if end < 0:
+                raise ValueError(f"Invalid array header: {header!r}")
+            inner = tail[1:end]
+            if inner == "":
                 field_list = []
             else:
-                field_list = [f.strip() for f in fields.split(self.delimiter)]
-        return ArrayMeta(name.strip() if name else None, count, field_list)
+                try:
+                    raw_fields = split_unquoted(
+                        inner, self.delimiter, strict=True
+                    )
+                except ValueError:
+                    raise ValueError(f"Invalid array header: {header!r}") from None
+                field_list = [unquote(field.strip()) for field in raw_fields]
+            tail = tail[end + 1 :].strip()
+        if tail:
+            raise ValueError(f"Invalid array header: {header!r}")
+        name = unquote(name_part) if name_part else None
+        return ArrayMeta(name, count, field_list)
 
     def _parse_array_body(
         self,
@@ -141,13 +183,9 @@ class Decoder:
                 raise ValueError("Inline array length mismatch")
             return values, start_idx
         if meta.fields is not None:
-            rows, idx = self._parse_tabular_rows(
-                meta, start_idx, child_level
-            )
+            rows, idx = self._parse_tabular_rows(meta, start_idx, child_level)
             return rows, idx
-        items, idx = self._parse_list_entries(
-            meta.count, start_idx, child_level
-        )
+        items, idx = self._parse_list_entries(meta.count, start_idx, child_level)
         return items, idx
 
     def _parse_tabular_rows(
@@ -179,19 +217,18 @@ class Decoder:
             current_level, content = self.lines[idx]
             if current_level < level:
                 break
-            # List entries can be at level (old format) or level+1 (new format with first key on same line)
-            # But we only start a new entry if we see a dash at the expected level
+            # List entries can be at level (old format) or level+1 (new format
+            # with the first key on the same line).
             if current_level == level and content.startswith("-"):
                 entry, idx = self._parse_list_item(idx, level)
                 items.append(entry)
                 if expected and len(items) == expected:
                     break
             elif current_level > level:
-                # This might be a continuation of the previous entry (remaining keys)
-                # Skip it - it should have been consumed by _parse_list_item
+                # Continuation of the previous entry (remaining keys); it
+                # should already have been consumed by _parse_list_item.
                 idx += 1
             else:
-                # Unexpected format
                 break
         if expected != 0 and len(items) != expected:
             raise ValueError("List entry count mismatch")
@@ -207,17 +244,17 @@ class Decoder:
                 return {}, next_idx
             value, new_idx = self._parse_block(next_idx, level + 1)
             return value, new_idx
-        
-        # Check if remainder contains a key-value pair (has ":")
-        if ":" in remainder:
+
+        # Check if remainder contains a key-value pair (has an unquoted ":")
+        if self._has_colon(remainder):
             # New format: "- key: value" or "- key:"
             key, value_part = self._split_field(remainder)
             result: dict[str, Any] = {key: None}
-            
+
             if value_part:
                 # Scalar value on same line: "- key: value"
                 result[key] = self._parse_scalar(value_part)
-                idx = idx + 1  # Move to next line
+                idx = idx + 1
             else:
                 # Nested value: "- key:" followed by block
                 next_idx = idx + 1
@@ -229,23 +266,23 @@ class Decoder:
                     nested_value, new_idx = self._parse_block(next_idx, level + 1)
                     result[key] = nested_value
                     idx = new_idx
-            
+
             # Parse remaining keys at level + 1 (they align with the value part)
             while idx < len(self.lines):
                 current_level, line_content = self.lines[idx]
                 if current_level < level:
                     break
                 if current_level != level + 1:
-                    # If we're back at the dash level, we've finished this list item
+                    # Back at the dash level means this list item is finished.
                     if current_level == level and line_content.startswith("-"):
                         break
-                    # Otherwise it's an error
-                    raise ValueError(f"Unexpected indentation at line: {line_content!r}")
-                
-                # Parse this key-value pair
-                if ":" not in line_content:
+                    raise ValueError(
+                        f"Unexpected indentation at line: {line_content!r}"
+                    )
+
+                if not self._has_colon(line_content):
                     break
-                
+
                 # Check if this line is an array header first
                 if self._line_represents_array_value(line_content):
                     name, value, new_idx = self._parse_array_from_line(idx)
@@ -254,16 +291,18 @@ class Decoder:
                     result[name] = value
                     idx = new_idx
                     continue
-                
+
                 # Otherwise, treat it as a regular key-value pair
                 key, value_part = self._split_field(line_content)
                 if value_part:
                     result[key] = self._parse_scalar(value_part)
                     idx += 1
                 else:
-                    # Nested object or other value
                     next_idx = idx + 1
-                    if next_idx >= len(self.lines) or self.lines[next_idx][0] <= level + 1:
+                    if (
+                        next_idx >= len(self.lines)
+                        or self.lines[next_idx][0] <= level + 1
+                    ):
                         result[key] = {}
                         idx = next_idx
                         continue
@@ -271,69 +310,49 @@ class Decoder:
                     result[key] = nested_value
                     idx = new_idx
             return result, idx
-        else:
-            # Scalar value on same line: "- value"
-            return self._parse_scalar(remainder), idx + 1
+
+        # Scalar value on same line: "- value"
+        return self._parse_scalar(remainder), idx + 1
 
     def _parse_row(self, text: str) -> List[Any]:
-        cells: List[str] = []
-        current: List[str] = []
-        in_quotes = False
-        escape = False
-        for char in text:
-            if escape:
-                current.append(char)
-                escape = False
-                continue
-            if char == "\\" and in_quotes:
-                escape = True
-                continue
-            if char == '"':
-                in_quotes = not in_quotes
-                current.append(char)
-                continue
-            if not in_quotes and char == self.delimiter:
-                cells.append("".join(current).strip())
-                current = []
-                continue
-            current.append(char)
-        cells.append("".join(current).strip())
-        if in_quotes:
-            raise ValueError("Unterminated quote in row")
-        return [self._parse_scalar(cell) for cell in cells if cell != "" or cell == '""']
+        try:
+            cells = split_unquoted(text, self.delimiter, strict=True)
+        except ValueError:
+            raise ValueError("Unterminated quote in row") from None
+        return [self._parse_scalar(cell.strip(" ")) for cell in cells]
 
     def _split_field(self, line: str) -> Tuple[str, str]:
-        key, remainder = line.split(":", 1)
-        return key.strip(), remainder.strip()
+        colon = find_unquoted(line, ":")
+        if colon < 0:
+            return unquote(line.strip()), ""
+        key = unquote(line[:colon].strip())
+        remainder = line[colon + 1 :].strip()
+        return key, remainder
 
-    def _line_header(self, content: str) -> str:
-        return content.split(":", 1)[0].strip()
+    def _header_part(self, content: str) -> str:
+        colon = find_unquoted(content, ":")
+        return content[:colon] if colon >= 0 else content
+
+    def _has_colon(self, content: str) -> bool:
+        return find_unquoted(content, ":") >= 0
 
     def _line_represents_array_value(self, content: str) -> bool:
-        header = self._line_header(content)
-        return "[" in header
+        return find_unquoted(self._header_part(content), "[") >= 0
 
     def _line_starts_with_array(self, content: str) -> bool:
-        header = self._line_header(content)
-        return "[" in header
+        return find_unquoted(self._header_part(content), "[") >= 0
+
+    def _looks_like_array_header(self, content: str) -> bool:
+        open_idx = find_unquoted(content, "[")
+        if open_idx < 0:
+            return False
+        return _ARRAY_BRACKET_RE.match(content[open_idx:]) is not None
 
     def _parse_scalar(self, token: str) -> Any:
         if not token:
             return ""
-        if token.startswith('"') and token.endswith('"'):
-            stripped = token[1:-1]
-            # Unescape: process \\\\ first to avoid interfering with other escapes
-            # Use a temporary marker for double backslashes
-            result = stripped.replace("\\\\", "\x00")
-            # Now unescape single escape sequences
-            result = (
-                result.replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t")
-                .replace('\\"', '"')
-            )
-            # Restore actual backslashes
-            return result.replace("\x00", "\\")
+        if is_quoted(token):
+            return unquote(token)
         lowered = token.lower()
         if lowered == "null":
             return None
@@ -341,17 +360,11 @@ class Decoder:
             return True
         if lowered == "false":
             return False
-        if self._is_int(token):
+        if _INT_RE.fullmatch(token):
             return int(token)
-        if self._is_float(token):
+        if NUMBER_RE.fullmatch(token):
             return float(token)
         return token
-
-    def _is_int(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?\d+", token) is not None
-
-    def _is_float(self, token: str) -> bool:
-        return re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", token) is not None
 
 
 @dataclass

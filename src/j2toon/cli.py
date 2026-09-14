@@ -183,16 +183,19 @@ Examples:
             )
             _write_text(args.output, output)
         else:
-            # Default: try to detect from content or assume JSON -> TOON
-            # For stdin/stdout, we'll try JSON -> TOON first
+            # Default: detect direction from content.  Read the input exactly
+            # once so that stdin is not consumed before the TOON fallback.
+            text = _read_text(args.input)
             try:
-                data = _read_json(args.input)
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try TOON -> JSON
+                decoded = toon2json(
+                    text, indent=args.indent, delimiter=args.delimiter
+                )
+                _write_json(args.output, decoded)
+            else:
                 output = json2toon(
                     data, indent=args.indent, delimiter=args.delimiter, mode=args.mode
                 )
                 _write_text(args.output, output)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, try TOON -> JSON
-                text = _read_text(args.input)
-                data = toon2json(text, indent=args.indent, delimiter=args.delimiter)
-                _write_json(args.output, data)
