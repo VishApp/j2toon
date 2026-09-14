@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from .encoder import encode as json2toon
+from .encoder import VALID_MODES, encode as json2toon
 from .decoder import decode as toon2json
 
 _DELIMITER_ALIASES = {
@@ -75,10 +75,16 @@ def json2toon_cli() -> None:
         choices=list(_DELIMITER_ALIASES.keys()),
         help="Delimiter: comma, tab, pipe (default: comma)",
     )
+    parser.add_argument(
+        "--mode",
+        default="auto",
+        choices=list(VALID_MODES),
+        help="Encoding mode for arrays of objects: auto, table, nested (default: auto)",
+    )
     args = parser.parse_args()
 
     data = _read_json(args.input)
-    output = json2toon(data, indent=args.indent, delimiter=args.delimiter)
+    output = json2toon(data, indent=args.indent, delimiter=args.delimiter, mode=args.mode)
     _write_text(args.output, output)
 
 
@@ -136,6 +142,12 @@ Examples:
         choices=list(_DELIMITER_ALIASES.keys()),
         help="Delimiter: comma, tab, pipe (default: comma)",
     )
+    convert_parser.add_argument(
+        "--mode",
+        default="auto",
+        choices=list(VALID_MODES),
+        help="Encoding mode for arrays of objects: auto, table, nested (default: auto)",
+    )
     
     args = parser.parse_args()
     
@@ -149,7 +161,9 @@ Examples:
         if input_path and input_path.endswith(".json"):
             # JSON -> TOON
             data = _read_json(args.input)
-            output = json2toon(data, indent=args.indent, delimiter=args.delimiter)
+            output = json2toon(
+                data, indent=args.indent, delimiter=args.delimiter, mode=args.mode
+            )
             _write_text(args.output, output)
         elif output_path and output_path.endswith(".json"):
             # TOON -> JSON
@@ -164,17 +178,24 @@ Examples:
         elif output_path and output_path.endswith(".toon"):
             # JSON -> TOON
             data = _read_json(args.input)
-            output = json2toon(data, indent=args.indent, delimiter=args.delimiter)
+            output = json2toon(
+                data, indent=args.indent, delimiter=args.delimiter, mode=args.mode
+            )
             _write_text(args.output, output)
         else:
-            # Default: try to detect from content or assume JSON -> TOON
-            # For stdin/stdout, we'll try JSON -> TOON first
+            # Default: detect direction from content.  Read the input exactly
+            # once so that stdin is not consumed before the TOON fallback.
+            text = _read_text(args.input)
             try:
-                data = _read_json(args.input)
-                output = json2toon(data, indent=args.indent, delimiter=args.delimiter)
-                _write_text(args.output, output)
-            except (json.JSONDecodeError, ValueError):
+                data = json.loads(text)
+            except json.JSONDecodeError:
                 # If JSON parsing fails, try TOON -> JSON
-                text = _read_text(args.input)
-                data = toon2json(text, indent=args.indent, delimiter=args.delimiter)
-                _write_json(args.output, data)
+                decoded = toon2json(
+                    text, indent=args.indent, delimiter=args.delimiter
+                )
+                _write_json(args.output, decoded)
+            else:
+                output = json2toon(
+                    data, indent=args.indent, delimiter=args.delimiter, mode=args.mode
+                )
+                _write_text(args.output, output)
