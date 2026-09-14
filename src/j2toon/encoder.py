@@ -6,9 +6,25 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Mapping, Sequence
 
 
-def encode(value: Any, *, indent: int = 2, delimiter: str = ",") -> str:
-    """Convert a JSON-compatible Python value into TOON."""
-    return Encoder(indent=indent, delimiter=delimiter).encode(value)
+#: Supported encoding modes for :func:`encode`.
+VALID_MODES = ("auto", "table", "nested")
+
+
+def encode(
+    value: Any, *, indent: int = 2, delimiter: str = ",", mode: str = "auto"
+) -> str:
+    """Convert a JSON-compatible Python value into TOON.
+
+    ``mode`` selects how arrays of objects are rendered:
+
+    * ``"auto"`` (default) – use a table when the items share the same scalar
+      fields, otherwise fall back to nested list entries.
+    * ``"table"`` – always use a table for arrays of objects; raise
+      :class:`ValueError` when an array of objects cannot be represented as a
+      table (mixed fields or non-scalar values).
+    * ``"nested"`` – never use tables; always emit nested list entries.
+    """
+    return Encoder(indent=indent, delimiter=delimiter, mode=mode).encode(value)
 
 
 @dataclass
@@ -17,12 +33,17 @@ class Encoder:
 
     indent: int = 2
     delimiter: str = ","
+    mode: str = "auto"
 
     def __post_init__(self) -> None:
         if self.indent <= 0:
             raise ValueError("indent must be a positive integer")
         if len(self.delimiter) != 1:
             raise ValueError("delimiter must be a single character")
+        if self.mode not in VALID_MODES:
+            raise ValueError(
+                "mode must be one of: " + ", ".join(VALID_MODES)
+            )
 
     def encode(self, value: Any) -> str:
         lines = self._encode_value(value, level=0, name=None)
@@ -63,16 +84,26 @@ class Encoder:
             lines.append(f"{indent}{label}:{suffix}")
             return lines
 
-        tabular_fields = self._tabular_fields(seq)
-        if tabular_fields:
-            header = f"{label}{{{self.delimiter.join(tabular_fields)}}}:"
-            lines.append(f"{indent}{header}")
-            for row in seq:
-                row_values = [self._format_scalar(row[field]) for field in tabular_fields]
-                lines.append(
-                    f"{self._indent(level + 1)}{self._join_row(row_values)}"
+        if self.mode != "nested":
+            tabular_fields = self._tabular_fields(seq)
+            if tabular_fields:
+                header = f"{label}{{{self.delimiter.join(tabular_fields)}}}:"
+                lines.append(f"{indent}{header}")
+                for row in seq:
+                    row_values = [
+                        self._format_scalar(row[field]) for field in tabular_fields
+                    ]
+                    lines.append(
+                        f"{self._indent(level + 1)}{self._join_row(row_values)}"
+                    )
+                return lines
+            if self.mode == "table" and self._expects_table(seq):
+                raise ValueError(
+                    "mode='table' cannot represent array "
+                    f"{name or '<root>'!r} as a table because its items do not "
+                    "share the same scalar fields; use mode='auto' or "
+                    "mode='nested' instead"
                 )
-            return lines
 
         lines.append(f"{indent}{label}:")
         for item in seq:
@@ -171,6 +202,10 @@ class Encoder:
             if not all(self._is_scalar(item[field]) for field in first_fields):
                 return None
         return first_fields
+
+    def _expects_table(self, seq: Sequence[Any]) -> bool:
+        """Whether ``seq`` looks like records that the caller expects as a table."""
+        return bool(seq) and all(isinstance(item, Mapping) for item in seq)
 
     def _is_scalar(self, value: Any) -> bool:
         return isinstance(value, (str, int, float, bool)) or value is None
